@@ -15,6 +15,7 @@ class LitWrapper(pl.LightningModule):
         self,
         model: nn.Module,
         optimiser: torch.optim.Optimizer,
+        scheduler: Optional[Any] = None,
         loss_fn: Callable = np_loss_fn,
         pred_fn: Callable = np_pred_fn,
         plot_fn: Optional[Callable] = None,
@@ -24,6 +25,7 @@ class LitWrapper(pl.LightningModule):
 
         self.model = model
         self.optimiser = optimiser
+        self.scheduler = scheduler
         self.loss_fn = loss_fn
         self.pred_fn = pred_fn
         self.plot_fn = plot_fn
@@ -35,7 +37,11 @@ class LitWrapper(pl.LightningModule):
         # Keep these for analysing.
         self.test_outputs: List[Any] = []
 
-        self.save_hyperparameters(ignore=["model"])
+        # self.save_hyperparameters(ignore=["model"])
+        # avoid Lightning trying to pickle function objects
+        self.save_hyperparameters(
+            ignore=["model", "optimiser", "scheduler", "loss_fn", "pred_fn", "plot_fn"]
+        )
 
     def forward(self, *args, **kwargs):
         return self.model(*args, **kwargs)
@@ -107,7 +113,18 @@ class LitWrapper(pl.LightningModule):
         self.val_batches = []
 
     def configure_optimizers(self):
-        return self.optimiser
+        if self.scheduler is None:
+            return self.optimiser
+            
+        return {
+            "optimizer": self.optimiser,
+            "lr_scheduler": {
+                "scheduler": self.scheduler,
+                "interval": "step",
+                "frequency": 1,
+                "name": "learning_rate",
+            },
+        }
 
 
 class LogPerformanceCallback(pl.Callback):

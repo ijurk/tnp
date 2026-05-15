@@ -1,6 +1,7 @@
 # Manually added files
 data/
 checkpoints/
+logs/
 *.DS_Store
 fig/
 wandb/

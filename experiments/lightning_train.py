@@ -7,17 +7,33 @@ from plot import plot
 
 import wandb
 from tnp.utils.data_loading import adjust_num_batches
-from tnp.utils.experiment_utils import initialize_experiment
+from tnp.utils.experiment_utils import initialize_experiment, create_lr_scheduler
 from tnp.utils.lightning_utils import LitWrapper, LogPerformanceCallback
+
+def get_project_root() -> str:
+    return os.environ.get(
+        "TNP_CRPS_ROOT",
+        os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..")),
+    )
 
 
 def main():
     experiment = initialize_experiment()
+    
+    # added for local checkpoints and naming 
+    project_root = get_project_root()
+    run_group = getattr(experiment.misc, "run_group", None)
+    run_id = getattr(experiment.misc, "run_id", None) or os.environ.get("TNP_RUN_ID")
+
+    run_name = experiment.misc.name
+    if run_id is not None:
+        run_name = f"{experiment.misc.name}-{run_id}"
 
     model = experiment.model
     gen_train = experiment.generators.train
     gen_val = experiment.generators.val
     optimiser = experiment.optimiser(model.parameters())
+    scheduler = create_lr_scheduler(optimiser, experiment, gen_train)
     epochs = experiment.params.epochs
 
     train_loader = torch.utils.data.DataLoader(
@@ -62,44 +78,116 @@ def main():
             pred_fn=experiment.misc.pred_fn,
         )
 
+    # new logic for resuming from local or W&B checkpoint
     if experiment.misc.resume_from_checkpoint is not None:
-        api = wandb.Api()
-        artifact = api.artifact(experiment.misc.resume_from_checkpoint)
-        artifact_dir = artifact.download()
-        ckpt_file = os.path.join(artifact_dir, "model.ckpt")
+        resume_ref = experiment.misc.resume_from_checkpoint
 
-        lit_model = (
-            LitWrapper.load_from_checkpoint(  # pylint: disable=no-value-for-parameter
-                ckpt_file,
-            )
-        )
+        if os.path.exists(resume_ref):
+            ckpt_file = resume_ref
+        else:
+            api = wandb.Api()
+            artifact = api.artifact(resume_ref)
+            artifact_dir = artifact.download()
+            ckpt_file = os.path.join(artifact_dir, "model.ckpt")
     else:
         ckpt_file = None
-        lit_model = LitWrapper(
-            model=model,
-            optimiser=optimiser,
-            loss_fn=experiment.misc.loss_fn,
-            pred_fn=experiment.misc.pred_fn,
-            plot_fn=plot_fn,
-            plot_interval=experiment.misc.plot_interval,
+        
+    lit_model = LitWrapper(
+        model=model,
+        optimiser=optimiser,
+        scheduler=scheduler,
+        loss_fn=experiment.misc.loss_fn,
+        pred_fn=experiment.misc.pred_fn,
+        plot_fn=plot_fn,
+        plot_interval=experiment.misc.plot_interval,
         )
+
+    # old logic for resuming from W&B only
+    # if experiment.misc.resume_from_checkpoint is not None:
+    #     api = wandb.Api()
+    #     artifact = api.artifact(experiment.misc.resume_from_checkpoint)
+    #     artifact_dir = artifact.download()
+    #     ckpt_file = os.path.join(artifact_dir, "model.ckpt")
+
+    #     lit_model = (
+    #         LitWrapper.load_from_checkpoint(  # pylint: disable=no-value-for-parameter
+    #             ckpt_file,
+    #         )
+    #     )
+    # else:
+    #     ckpt_file = None
+    #     lit_model = LitWrapper(
+    #         model=model,
+    #         optimiser=optimiser,
+    #         loss_fn=experiment.misc.loss_fn,
+    #         pred_fn=experiment.misc.pred_fn,
+    #         plot_fn=plot_fn,
+    #         plot_interval=experiment.misc.plot_interval,
+    #     )
+
+    # added for local checkpoints
+    checkpoint_parts = [
+        project_root,
+        "checkpoints",
+    ]
+
+    if run_group is not None:
+        checkpoint_parts.append(str(run_group))
+
+    checkpoint_parts.extend(
+        [
+            experiment.misc.project,
+            run_name,
+        ]
+    )
+
+    checkpoint_dir = os.path.join(*checkpoint_parts)
+    os.makedirs(checkpoint_dir, exist_ok=True)
+
+    # add local checkpointing independent of W&B + W&B
+    checkpoint_callback = pl.callbacks.ModelCheckpoint(
+        dirpath=checkpoint_dir,
+        filename="{epoch:04d}",
+        every_n_epochs=experiment.misc.checkpoint_interval,
+        save_last=True,
+    )
+
+    callbacks = [checkpoint_callback]
+
+    if scheduler is not None and experiment.misc.logging:
+        callbacks.append(pl.callbacks.LearningRateMonitor(logging_interval="step"))
 
     if experiment.misc.logging:
         logger = pl.loggers.WandbLogger(
             project=experiment.misc.project,
-            name=experiment.misc.name,
+            entity=os.environ.get("WANDB_ENTITY", None),
+            name=run_name,
             config=OmegaConf.to_container(experiment.config),
             log_model="all",
-        )
-        checkpoint_callback = pl.callbacks.ModelCheckpoint(
-            every_n_epochs=experiment.misc.checkpoint_interval,
-            save_last=True,
+            save_dir=os.path.join(project_root, "logs"),
         )
         performance_callback = LogPerformanceCallback()
-        callbacks = [checkpoint_callback, performance_callback]
+        callbacks.append(performance_callback)
     else:
         logger = False
-        callbacks = None
+
+    # old logic for W&B loggin only
+    # if experiment.misc.logging:
+    #     logger = pl.loggers.WandbLogger(
+    #         project=experiment.misc.project,
+    #         name=experiment.misc.name,
+    #         config=OmegaConf.to_container(experiment.config),
+    #         log_model="all",
+    #     )
+    #     checkpoint_callback = pl.callbacks.ModelCheckpoint(
+    #         every_n_epochs=experiment.misc.checkpoint_interval,
+    #         save_last=True,
+    #     )
+    #     performance_callback = LogPerformanceCallback()
+    #     callbacks = [checkpoint_callback, performance_callback]
+    # else:
+    #     logger = False
+    #     callbacks = None
 
     trainer = pl.Trainer(
         logger=logger,

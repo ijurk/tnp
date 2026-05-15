@@ -9,6 +9,13 @@ import lightning.pytorch as pl
 import torch
 from hydra.utils import instantiate
 from omegaconf import DictConfig, OmegaConf
+from torch.optim.lr_scheduler import (
+    CosineAnnealingLR,
+    LambdaLR,
+    LRScheduler,
+    SequentialLR,
+)
+
 
 import wandb
 
@@ -208,3 +215,193 @@ def initialize_evaluation() -> DictConfig:
     )
 
     return experiment
+
+
+##############################################################################
+# Learning rate scheduler utils
+##############################################################################
+
+
+def _calculate_total_steps(experiment: DictConfig, gen_train: Any) -> Optional[int]:
+    """Calculate total optimisation steps for step-wise LR scheduling."""
+    try:
+        epochs = experiment.params.epochs
+        train_batches = gen_train.num_batches
+        total_steps = epochs * train_batches
+
+        print(
+            f"Total training steps: {total_steps} "
+            f"(epochs={epochs}, batches_per_epoch={train_batches})"
+        )
+        return total_steps
+    except AttributeError as e:
+        print(
+            f"Failed to calculate total steps "
+            f"(missing config or generator property): {e}"
+        )
+        return None
+
+
+def _get_warmup_steps(scheduler_config: DictConfig, total_steps: int) -> int:
+    """Calculate warmup steps from either explicit steps or a fraction."""
+    if not hasattr(scheduler_config, "warmup"):
+        return 0
+
+    warmup_config = scheduler_config.warmup
+
+    if hasattr(warmup_config, "steps") and warmup_config.steps is not None:
+        return int(warmup_config.steps)
+
+    if hasattr(warmup_config, "fraction") and warmup_config.fraction is not None:
+        return int(total_steps * float(warmup_config.fraction))
+
+    return 0
+
+
+def _get_cosine_params(scheduler_config: DictConfig, total_steps: int) -> dict:
+    """Get T_max and eta_min for cosine annealing."""
+    cosine_config = getattr(scheduler_config, "cosine", {})
+
+    eta_min = getattr(cosine_config, "eta_min", 0.0)
+    T_max = getattr(cosine_config, "T_max", total_steps)
+
+    if T_max is None:
+        T_max = total_steps
+
+    return {"eta_min": eta_min, "T_max": T_max}
+
+
+def _create_cosine_scheduler(
+    optimiser: torch.optim.Optimizer,
+    scheduler_config: DictConfig,
+    total_steps: int,
+) -> LRScheduler:
+    """Create a CosineAnnealingLR scheduler."""
+    params = _get_cosine_params(scheduler_config, total_steps)
+
+    scheduler = CosineAnnealingLR(
+        optimiser,
+        T_max=params["T_max"],
+        eta_min=params["eta_min"],
+    )
+
+    print(
+        f"Created cosine scheduler: "
+        f"T_max={params['T_max']}, eta_min={params['eta_min']}"
+    )
+
+    return scheduler
+
+
+def _create_warmup_scheduler(
+    optimiser: torch.optim.Optimizer,
+    scheduler_config: DictConfig,
+    total_steps: int,
+) -> Optional[LRScheduler]:
+    """Create a simple linear warmup scheduler."""
+    warmup_steps = _get_warmup_steps(scheduler_config, total_steps)
+
+    if warmup_steps <= 0:
+        print(
+            "Warning: warmup scheduler requested but warmup_steps <= 0. "
+            "Using constant learning rate."
+        )
+        return None
+
+    def warmup_lambda(current_step: int):
+        return min(1.0, float(current_step) / float(max(1, warmup_steps)))
+
+    scheduler = LambdaLR(optimiser, warmup_lambda)
+    print(f"Created warmup scheduler: warmup_steps={warmup_steps}")
+
+    return scheduler
+
+
+def _create_warmup_cosine_scheduler(
+    optimiser: torch.optim.Optimizer,
+    scheduler_config: DictConfig,
+    total_steps: int,
+) -> LRScheduler:
+    """Create a warmup scheduler followed by cosine annealing."""
+    warmup_steps = _get_warmup_steps(scheduler_config, total_steps)
+    cosine_params = _get_cosine_params(scheduler_config, total_steps)
+    T_max_original = cosine_params["T_max"]
+
+    if warmup_steps <= 0 or T_max_original <= warmup_steps:
+        print(
+            "Warning: warmup-cosine requested but warmup_steps is invalid "
+            "or too long. Using cosine only."
+        )
+        return _create_cosine_scheduler(optimiser, scheduler_config, total_steps)
+
+    warmup_scheduler = LambdaLR(
+        optimiser,
+        lr_lambda=lambda step: min(
+            1.0, float(step) / float(max(1, warmup_steps))
+        ),
+    )
+
+    cosine_T_max_adjusted = T_max_original - warmup_steps
+
+    cosine_scheduler = CosineAnnealingLR(
+        optimiser,
+        T_max=cosine_T_max_adjusted,
+        eta_min=cosine_params["eta_min"],
+    )
+
+    scheduler = SequentialLR(
+        optimiser,
+        schedulers=[warmup_scheduler, cosine_scheduler],
+        milestones=[warmup_steps],
+    )
+
+    print(
+        f"Created warmup+cosine scheduler: "
+        f"warmup={warmup_steps} steps, "
+        f"cosine T_max={cosine_T_max_adjusted}, "
+        f"eta_min={cosine_params['eta_min']}"
+    )
+
+    return scheduler
+
+
+def create_lr_scheduler(
+    optimiser: torch.optim.Optimizer,
+    experiment: DictConfig,
+    gen_train: Any,
+) -> Optional[LRScheduler]:
+    """Create a learning-rate scheduler from the experiment config."""
+    scheduler_config = getattr(experiment, "scheduler", None)
+
+    if scheduler_config is None:
+        print("No scheduler configuration found. Using constant learning rate.")
+        return None
+
+    scheduler_type = getattr(scheduler_config, "type", "constant").lower()
+
+    if scheduler_type == "constant":
+        print("Using constant learning rate.")
+        return None
+
+    total_steps = _calculate_total_steps(experiment, gen_train)
+
+    if total_steps is None:
+        return None
+
+    scheduler_factory = {
+        "cosine": _create_cosine_scheduler,
+        "warmup": _create_warmup_scheduler,
+        "warmup_cosine": _create_warmup_cosine_scheduler,
+    }
+
+    creator = scheduler_factory.get(scheduler_type)
+
+    if creator is None:
+        print(f"Unknown scheduler type: {scheduler_type}. Using constant LR.")
+        return None
+
+    try:
+        return creator(optimiser, scheduler_config, total_steps)
+    except Exception as e:
+        print(f"Failed to create scheduler of type '{scheduler_type}': {e}")
+        return None
