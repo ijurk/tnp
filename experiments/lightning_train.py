@@ -23,11 +23,10 @@ def main():
     # added for local checkpoints and naming 
     project_root = get_project_root()
     run_group = getattr(experiment.misc, "run_group", None)
-    run_id = getattr(experiment.misc, "run_id", None) or os.environ.get("TNP_RUN_ID")
+    run_id = getattr(experiment.misc, "run_id", None) or os.environ.get("TNP_RUN_ID", "default-run")
 
-    run_name = experiment.misc.name
-    if run_id is not None:
-        run_name = f"{experiment.misc.name}-{run_id}"
+    # W&B run/display name
+    run_name = f"{experiment.misc.name}-{run_id}"
 
     model = experiment.model
     gen_train = experiment.generators.train
@@ -137,7 +136,8 @@ def main():
     checkpoint_parts.extend(
         [
             experiment.misc.project,
-            run_name,
+            experiment.misc.name,
+            run_id,
         ]
     )
 
