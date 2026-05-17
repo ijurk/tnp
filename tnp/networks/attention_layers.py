@@ -1,3 +1,4 @@
+from __future__ import annotations #added for python 3.8
 from abc import ABC
 from functools import partial
 from typing import Optional, Tuple, Union
