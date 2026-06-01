@@ -88,3 +88,4 @@ misc:
   resume_from_checkpoint: null
   gradient_clip_val: 0.5
   plot_interval: 10
+  pin_memory: false
