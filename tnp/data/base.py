@@ -4,7 +4,6 @@ from dataclasses import dataclass
 from typing import Any, Optional
 
 import numpy as np
-import pytorch_lightning as pl
 import torch
 
 
@@ -83,17 +82,49 @@ class DataGenerator(torch.utils.data.IterableDataset, ABC):
         self.batches = None
 
     def __iter__(self):
-        """Reset batch counter and return self."""
+        """Reset the batch counter and return this iterable dataset.
+
+        For deterministic generators, batches are generated once from
+        ``deterministic_seed`` and cached. The caller's Python, NumPy,
+        PyTorch CPU, and initialized CUDA RNG states are restored exactly
+        afterwards.
+        """
         if self.deterministic and self.batches is None:
-            # Set deterministic seed.
-            torch_seed = torch.seed()
-            np_seed = np.random.seed()
-            random_state = random.getstate()
-            pl.seed_everything(self.deterministic_seed)
-            self.batches = [self.generate_batch() for _ in range(self.num_batches)]
-            torch.manual_seed(torch_seed)
-            np.random.seed(np_seed)
-            random.setstate(random_state)
+            torch_state = torch.get_rng_state()
+            numpy_state = np.random.get_state()
+            python_state = random.getstate()
+
+            cuda_states = None
+            if torch.cuda.is_available() and torch.cuda.is_initialized():
+                cuda_states = torch.cuda.get_rng_state_all()
+
+            try:
+                seed = int(self.deterministic_seed)
+
+                # Seed the global CPU generator used by torch.rand,
+                # torch.randn, torch.randint, and related operations.
+                torch.random.default_generator.manual_seed(seed)
+
+                # Only touch CUDA RNGs if CUDA was already initialized;
+                # CPU data-loader workers should not initialize CUDA.
+                if cuda_states is not None:
+                    torch.cuda.manual_seed_all(seed)
+
+                np.random.seed(seed)
+                random.seed(seed)
+
+                self.batches = [
+                    self.generate_batch()
+                    for _ in range(self.num_batches)
+                ]
+
+            finally:
+                torch.set_rng_state(torch_state)
+                np.random.set_state(numpy_state)
+                random.setstate(python_state)
+
+                if cuda_states is not None:
+                    torch.cuda.set_rng_state_all(cuda_states)
 
         self.batch_counter = 0
         return self
